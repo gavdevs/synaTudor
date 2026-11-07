@@ -22,6 +22,18 @@
 #define PROV_REPLACE_OWF 23
 #define PROV_RSA_AES 24
 
+#define CRYPT_NEWKEYSET 0x00000008
+#define CRYPT_DELETEKEYSET 0x00000010
+#define CRYPT_VERIFYCONTEXT 0xf0000000
+
+#define ERROR_NOT_ENOUGH_MEMORY 8
+#define ERROR_INVALID_PARAMETER 87
+#define NTE_BAD_FLAGS 0x80090009
+#define NTE_BAD_PROVIDER 0x80090013
+#define NTE_BAD_PROV_TYPE 0x80090014
+#define NTE_FAIL 0x80090020
+#define NTE_INVALID_HANDLE 0x80090026
+
 #define ALG_CLASS_ANY (0)
 #define ALG_CLASS_SIGNATURE (1 << 13)
 #define ALG_CLASS_MSG_ENCRYPT (2 << 13)
@@ -160,12 +172,30 @@ typedef struct {
     BYTE rgbKeyData[];
 } PLAINTEXTKEYBLOB;
 
-#define HP_ALGID 0x0001 
+#define HP_ALGID 0x0001
 #define HP_HASHVAL 0x0002
 #define HP_HASHSIZE 0x0004
 #define HP_HMAC_INFO 0x0005
 #define HP_TLS1PRF_LABEL 0x0006
 #define HP_TLS1PRF_SEED 0x0007
+
+/* CryptSetKeyParam / CryptGetKeyParam parameters */
+#define KP_IV       1
+#define KP_PADDING  3
+#define KP_MODE     4
+#define KP_MODE_BITS 5
+#define KP_ALGID    7
+#define KP_BLOCKLEN 8
+#define KP_KEYLEN   9
+
+/* Cipher modes */
+#define CRYPT_MODE_CBC 1
+#define CRYPT_MODE_ECB 2
+#define CRYPT_MODE_OFB 3
+#define CRYPT_MODE_CFB 4
+
+/* Padding methods */
+#define PKCS5_PADDING 1
 
 typedef struct {
     ALG_ID HashAlgid;

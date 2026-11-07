@@ -5,6 +5,7 @@
 #include "enroll.h"
 #include "verify.h"
 #include "identify.h"
+#include "list.h"
 
 G_DEFINE_TYPE(FpiDeviceTudor, fpi_device_tudor, FP_TYPE_DEVICE)
 
@@ -14,6 +15,8 @@ GType fpi_tod_shared_driver_get_type() {
 
 static FpIdEntry tudor_ids[] = {
     { .vid = 0x06cb, .pid = 0x00be },
+    { .vid = 0x06cb, .pid = 0x00f0 }, // HP EliteBook 840/845 G8 (Synaptics FS7605, "110" driver)
+    { .vid = 0x06cb, .pid = 0x00df }, // HP EliteBook 830 G7 (HP "110" driver, open-only testing)
 //  { .vid = 0x06cb, .pid = 0x00bd }, //TODO Check if it's also supported
     { 0 }
 };
@@ -172,6 +175,7 @@ static void fpi_device_tudor_class_init(FpiDeviceTudorClass *class) {
     dev_class->enroll = fpi_device_tudor_enroll;
     dev_class->verify = fpi_device_tudor_verify;
     dev_class->identify = fpi_device_tudor_identify;
+    dev_class->list = fpi_device_tudor_list;
     dev_class->delete = fpi_device_tudor_delete;
     dev_class->clear_storage = fpi_device_clear_storage;
 

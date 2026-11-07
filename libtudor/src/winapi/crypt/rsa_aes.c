@@ -8,6 +8,11 @@ static void rsa_aes_destroy_key(struct crypt_provider *prov, void *key) {
 
 }
 
+struct crypt_provider crypt_prov_rsa_full = {
+    .import_key = (crypt_import_key_fnc*) rsa_aes_import_key,
+    .destroy_key = (crypt_destroy_key_fnc*) rsa_aes_destroy_key
+};
+
 struct crypt_provider crypt_prov_rsa_aes = {
     .import_key = (crypt_import_key_fnc*) rsa_aes_import_key,
     .destroy_key = (crypt_destroy_key_fnc*) rsa_aes_destroy_key

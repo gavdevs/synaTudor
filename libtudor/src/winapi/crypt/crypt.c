@@ -1,19 +1,78 @@
 #include <openssl/ecdsa.h>
 #include <openssl/rand.h>
+#include <openssl/evp.h>
+#include <string.h>
 #include "crypt.h"
 
-__winfnc BOOL CryptAcquireContextA(struct crypt_provider **prov, const char *cont_name, const char *prov_name, DWORD prov_type, DWORD flags) {
+static const char crypt_prov_base_name[] = "Microsoft Base Cryptographic Provider v1.0";
+static const char crypt_prov_enhanced_name[] = "Microsoft Enhanced Cryptographic Provider v1.0";
+static const char crypt_prov_rsa_aes_name[] = "Microsoft Enhanced RSA and AES Cryptographic Provider";
+
+static BOOL crypt_acquire_context(struct crypt_provider **out, DWORD prov_type, DWORD flags) {
+    if(!out) { winerr_set_code(ERROR_INVALID_PARAMETER); return FALSE; }
+    *out = NULL;
+
+    struct crypt_provider *provider_type;
     switch(prov_type) {
-        case PROV_RSA_AES: *prov = &crypt_prov_rsa_aes; return TRUE;
-        default: {
-            log_warn("CryptAcquireContextA | Couldn't find provider for container '%s' provider '%s' provider type 0x%x flags 0x%x", cont_name, prov_name, prov_type, flags);
-            return FALSE;
-        }
+        case PROV_RSA_FULL: provider_type = &crypt_prov_rsa_full; break;
+        case PROV_RSA_AES: provider_type = &crypt_prov_rsa_aes; break;
+        default: winerr_set_code(NTE_BAD_PROV_TYPE); return FALSE;
     }
+
+    /* This provider implements hashing, RNG and caller-supplied symmetric keys.
+     * It does not persist or manufacture private key containers. */
+    if(flags & ~CRYPT_VERIFYCONTEXT) { winerr_set_code(NTE_BAD_FLAGS); return FALSE; }
+
+    struct crypt_provider *prov = malloc(sizeof(*prov));
+    if(!prov) { winerr_set_code(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
+    *prov = *provider_type;
+    *out = prov;
+    return TRUE;
+}
+
+static BOOL crypt_provider_name_valid_a(const char *name, DWORD prov_type) {
+    if(!name) return TRUE;
+    if(prov_type == PROV_RSA_FULL) {
+        return strcmp(name, crypt_prov_base_name) == 0 || strcmp(name, crypt_prov_enhanced_name) == 0;
+    }
+    return prov_type == PROV_RSA_AES && strcmp(name, crypt_prov_rsa_aes_name) == 0;
+}
+
+static BOOL crypt_wstr_equals_ascii(const char16_t *wstr, const char *str) {
+    while(*wstr && *str) {
+        if(*wstr >= 0x80 || *wstr != (char16_t) (unsigned char) *str) return FALSE;
+        wstr++;
+        str++;
+    }
+    return *wstr == 0 && *str == '\0';
+}
+
+static BOOL crypt_provider_name_valid_w(const char16_t *name, DWORD prov_type) {
+    if(!name) return TRUE;
+    if(prov_type == PROV_RSA_FULL) {
+        return crypt_wstr_equals_ascii(name, crypt_prov_base_name) || crypt_wstr_equals_ascii(name, crypt_prov_enhanced_name);
+    }
+    return prov_type == PROV_RSA_AES && crypt_wstr_equals_ascii(name, crypt_prov_rsa_aes_name);
+}
+
+__winfnc BOOL CryptAcquireContextA(struct crypt_provider **prov, const char *cont_name, const char *prov_name, DWORD prov_type, DWORD flags) {
+    if(prov) *prov = NULL;
+    if(!crypt_provider_name_valid_a(prov_name, prov_type)) { winerr_set_code(NTE_BAD_PROVIDER); return FALSE; }
+    return crypt_acquire_context(prov, prov_type, flags);
 }
 WINAPI(CryptAcquireContextA)
 
+__winfnc BOOL CryptAcquireContextW(struct crypt_provider **prov, const char16_t *cont_name, const char16_t *prov_name, DWORD prov_type, DWORD flags) {
+    if(prov) *prov = NULL;
+    if(!crypt_provider_name_valid_w(prov_name, prov_type)) { winerr_set_code(NTE_BAD_PROVIDER); return FALSE; }
+    return crypt_acquire_context(prov, prov_type, flags);
+}
+WINAPI(CryptAcquireContextW)
+
 __winfnc BOOL CryptReleaseContext(struct crypt_provider *prov, DWORD flags) {
+    if(!prov) { winerr_set_code(NTE_INVALID_HANDLE); return FALSE; }
+    if(flags != 0) { winerr_set_code(NTE_BAD_FLAGS); return FALSE; }
+    free(prov);
     return TRUE;
 }
 WINAPI(CryptReleaseContext)
@@ -33,6 +92,9 @@ __winfnc BOOL CryptImportKey(struct crypt_provider *prov, const BLOBHEADER *data
     if(!key) { winerr_set_errno(); return FALSE; }
     key->prov = prov;
     key->key_data = NULL;
+    memset(key->iv, 0, sizeof(key->iv));
+    key->mode = CRYPT_MODE_CBC;
+    key->padding = PKCS5_PADDING;
 
     if(data->bType == type_PLAINTEXTKEYBLOB) {
         //Copy plaintext data
@@ -72,6 +134,106 @@ __winfnc BOOL CryptDestroyKey(struct crypt_key *key) {
     return TRUE;
 }
 WINAPI(CryptDestroyKey)
+
+/* ---- CAPI symmetric (AES) crypto, backed by OpenSSL EVP ---------------------
+ * Used by the HP "110" driver's secure-pairing handshake. The raw key bytes are
+ * in key->plain_data (imported via CryptImportKey/PLAINTEXTKEYBLOB); IV and mode
+ * come from CryptSetKeyParam. Default mode CBC, default padding PKCS#7. */
+
+static const EVP_CIPHER *capi_aes_cipher(struct crypt_key *key) {
+    int ecb = (key->mode == CRYPT_MODE_ECB);
+    switch(key->plain_size) {
+        case 16: return ecb ? EVP_aes_128_ecb() : EVP_aes_128_cbc();
+        case 24: return ecb ? EVP_aes_192_ecb() : EVP_aes_192_cbc();
+        case 32: return ecb ? EVP_aes_256_ecb() : EVP_aes_256_cbc();
+        default: return NULL;
+    }
+}
+
+__winfnc BOOL CryptSetKeyParam(struct crypt_key *key, DWORD param, const BYTE *data, DWORD flags) {
+    switch(param) {
+        case KP_IV:      if(data) memcpy(key->iv, data, sizeof(key->iv)); return TRUE;
+        case KP_MODE:    if(data) key->mode = *(const DWORD*) data; return TRUE;
+        case KP_PADDING: if(data) key->padding = *(const DWORD*) data; return TRUE;
+        case KP_MODE_BITS: return TRUE;
+        default: log_warn("CryptSetKeyParam: unsupported param %u", (unsigned) param); return TRUE;
+    }
+}
+WINAPI(CryptSetKeyParam)
+
+__winfnc BOOL CryptGetKeyParam(struct crypt_key *key, DWORD param, BYTE *data, DWORD *data_len, DWORD flags) {
+    DWORD v;
+    switch(param) {
+        case KP_IV:
+            if(!data) { *data_len = sizeof(key->iv); return TRUE; }
+            if(*data_len < sizeof(key->iv)) { *data_len = sizeof(key->iv); winerr_set_code(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+            memcpy(data, key->iv, sizeof(key->iv)); *data_len = sizeof(key->iv); return TRUE;
+        case KP_BLOCKLEN: v = 128; goto ret_dword;
+        case KP_KEYLEN:   v = (DWORD)(key->plain_size * 8); goto ret_dword;
+        case KP_MODE:     v = key->mode; goto ret_dword;
+        case KP_PADDING:  v = key->padding; goto ret_dword;
+        default: log_warn("CryptGetKeyParam: unsupported param %u", (unsigned) param); winerr_set(); return FALSE;
+    }
+ret_dword:
+    if(!data) { *data_len = sizeof(DWORD); return TRUE; }
+    if(*data_len < sizeof(DWORD)) { *data_len = sizeof(DWORD); winerr_set_code(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+    memcpy(data, &v, sizeof(DWORD)); *data_len = sizeof(DWORD); return TRUE;
+}
+WINAPI(CryptGetKeyParam)
+
+__winfnc BOOL CryptEncrypt(struct crypt_key *key, struct crypt_hash *hash, BOOL final, DWORD flags, BYTE *data, DWORD *data_len, DWORD buf_len) {
+    const int block = 16;
+    if(hash) log_warn("CryptEncrypt: hHash unsupported, ignoring");
+    const EVP_CIPHER *cipher = capi_aes_cipher(key);
+    if(!cipher) { winerr_set(); return FALSE; }
+
+    DWORD in_len = *data_len;
+    DWORD out_needed = final ? ((in_len / block) + 1) * block : in_len;
+    if(!data) { *data_len = out_needed; return TRUE; }
+    if(final && buf_len < out_needed) { *data_len = out_needed; winerr_set_code(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if(!ctx) { winerr_set(); return FALSE; }
+    if(EVP_EncryptInit_ex(ctx, cipher, NULL, (const unsigned char*) key->plain_data, key->mode == CRYPT_MODE_ECB ? NULL : key->iv) != 1) { EVP_CIPHER_CTX_free(ctx); winerr_set(); return FALSE; }
+    EVP_CIPHER_CTX_set_padding(ctx, final ? 1 : 0);
+
+    int outl = 0, tmpl = 0;
+    if(EVP_EncryptUpdate(ctx, data, &outl, data, (int) in_len) != 1) { EVP_CIPHER_CTX_free(ctx); winerr_set(); return FALSE; }
+    if(EVP_EncryptFinal_ex(ctx, data + outl, &tmpl) != 1) { EVP_CIPHER_CTX_free(ctx); winerr_set(); return FALSE; }
+    EVP_CIPHER_CTX_free(ctx);
+
+    DWORD total = (DWORD)(outl + tmpl);
+    if(!final && key->mode != CRYPT_MODE_ECB && total >= 16) memcpy(key->iv, data + total - 16, 16); /* CBC chaining */
+    *data_len = total;
+    return TRUE;
+}
+WINAPI(CryptEncrypt)
+
+__winfnc BOOL CryptDecrypt(struct crypt_key *key, struct crypt_hash *hash, BOOL final, DWORD flags, BYTE *data, DWORD *data_len) {
+    if(hash) log_warn("CryptDecrypt: hHash unsupported, ignoring");
+    const EVP_CIPHER *cipher = capi_aes_cipher(key);
+    if(!cipher) { winerr_set(); return FALSE; }
+
+    DWORD in_len = *data_len;
+    unsigned char next_iv[16];
+    int chain = (!final && key->mode != CRYPT_MODE_ECB && in_len >= 16);
+    if(chain) memcpy(next_iv, data + in_len - 16, 16);
+
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if(!ctx) { winerr_set(); return FALSE; }
+    if(EVP_DecryptInit_ex(ctx, cipher, NULL, (const unsigned char*) key->plain_data, key->mode == CRYPT_MODE_ECB ? NULL : key->iv) != 1) { EVP_CIPHER_CTX_free(ctx); winerr_set(); return FALSE; }
+    EVP_CIPHER_CTX_set_padding(ctx, final ? 1 : 0);
+
+    int outl = 0, tmpl = 0;
+    if(EVP_DecryptUpdate(ctx, data, &outl, data, (int) in_len) != 1) { EVP_CIPHER_CTX_free(ctx); winerr_set(); return FALSE; }
+    if(EVP_DecryptFinal_ex(ctx, data + outl, &tmpl) != 1) { EVP_CIPHER_CTX_free(ctx); winerr_set(); return FALSE; }
+    EVP_CIPHER_CTX_free(ctx);
+
+    if(chain) memcpy(key->iv, next_iv, 16); /* CBC chaining */
+    *data_len = (DWORD)(outl + tmpl);
+    return TRUE;
+}
+WINAPI(CryptDecrypt)
 
 __winfnc BOOL CryptCreateHash(struct crypt_provider *prov, ALG_ID alg_id, struct crypt_key *key, DWORD flags, struct crypt_hash **out) {
     //Get the algorithm
@@ -260,8 +422,15 @@ __winfnc BOOL CryptUnprotectMemory(void *data, DWORD size, DWORD flags) {
 }
 WINAPI(CryptUnprotectMemory);
 
-__winfnc BOOL CryptGenRandom(HANDLE prov, DWORD len, BYTE *buf) {
-    LIBCRYPTO_ERR(RAND_bytes(buf, (int) len));
+__winfnc BOOL CryptGenRandom(struct crypt_provider *prov, DWORD len, BYTE *buf) {
+    if(!prov) { winerr_set_code(NTE_INVALID_HANDLE); return FALSE; }
+    if(len != 0 && !buf) { winerr_set_code(ERROR_INVALID_PARAMETER); return FALSE; }
+    if(len == 0) return TRUE;
+    if(RAND_bytes_ex(NULL, buf, (size_t) len, 0) != 1) {
+        ERR_clear_error();
+        winerr_set_code(NTE_FAIL);
+        return FALSE;
+    }
     return TRUE;
 }
 WINAPI(CryptGenRandom)

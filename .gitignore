@@ -1,1 +1,4 @@
-build
+buildbuild
+hpdrv/
+libtudor/hpdrv/
+*.dll

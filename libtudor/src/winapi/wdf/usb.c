@@ -1,3 +1,4 @@
+#include <stdlib.h>
 #include "internal.h"
 
 typedef struct {
@@ -434,6 +435,13 @@ static NTSTATUS usb_transfer_start(struct winwdf_request *req, struct transfer_r
 
     //Initialize remaining transfer fields
     ctx->transfer->timeout = (timeout > 0) ? (unsigned int) timeout : 0;
+    /* DIAGNOSTIC: optionally clamp infinite (0) timeouts to a finite value so a
+     * stuck read (e.g. enumerating an orphan secure-DB record during open)
+     * fails instead of hanging forever. Opt-in via SYNA_USB_TIMEOUT=<ms>. */
+    if(ctx->transfer->timeout == 0) {
+        const char *e = getenv("SYNA_USB_TIMEOUT");
+        if(e) { int v = atoi(e); if(v > 0) ctx->transfer->timeout = (unsigned int) v; }
+    }
     ctx->transfer->callback = (libusb_transfer_cb_fn) pipe_transfer_callback;
     ctx->transfer->user_data = ctx;
 

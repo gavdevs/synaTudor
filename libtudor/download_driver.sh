@@ -1,25 +1,16 @@
 #!/bin/bash -e
+# PATCHED for HP EliteBook 840 G8 (Synaptics FS7605, 06cb:00f0):
+# Instead of downloading the Lenovo 00be driver, use the locally-staged HP "110"
+# driver DLLs (hpdrv/), copied into the 104 output names so no symbol churn is needed.
 
 HASH_FILE="$1"
 TMP_DIR="$2"
 OUT_DIR="$3"
-DLLS=${@:4}
+# remaining args ($4..) are the requested output DLL names (synaFpAdapter104.dll, synaWudfBioUsb104.dll)
 
-mkdir -p "$TMP_DIR"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+HP="$SCRIPT_DIR/hpdrv"
 
-#Download the driver executable and check hash
-INSTALLER="$TMP_DIR/installer.exe"
-wget https://download.lenovo.com/pccbbs/mobiles/r19fp02w.exe -O "$INSTALLER"
-shasum "$INSTALLER" | cut -d" " -f1 | cmp - "$HASH_FILE"
-
-#Extract the driver
-WINDRV="$TMP_DIR/windrv"
-mkdir -p "$WINDRV"
-innoextract -d "$WINDRV" "$INSTALLER"
-
-#Copy outputs
 mkdir -p "$OUT_DIR"
-for dll in $DLLS
-do
-    cp $(find "$WINDRV" -name "$dll") "$OUT_DIR/$dll"
-done
+cp "$HP/synaFpAdapter110.dll"  "$OUT_DIR/synaFpAdapter104.dll"
+cp "$HP/synaWudfBioUsb110.dll" "$OUT_DIR/synaWudfBioUsb104.dll"

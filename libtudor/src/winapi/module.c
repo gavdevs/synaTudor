@@ -15,6 +15,7 @@ static void module_destr(struct winmodule *module) {
 }
 
 struct winmodule *winmodule_find(const char *name) {
+    if(!name) return NULL;
     cant_fail_ret(pthread_rwlock_rdlock(&modules_lock));
 
     struct winmodule *module = NULL;
@@ -80,6 +81,11 @@ __winfnc HANDLE LoadLibraryExW(const char16_t *name, HANDLE file, DWORD flags) {
 }
 WINAPI(LoadLibraryExW)
 
+__winfnc HANDLE LoadLibraryW(const char16_t *name) {
+    return LoadLibraryExW(name, NULL, 0);
+}
+WINAPI(LoadLibraryW)
+
 __winfnc BOOL FreeLibrary(HANDLE handle) {
     winhandle_destroy(handle);
     return TRUE;
@@ -87,12 +93,16 @@ __winfnc BOOL FreeLibrary(HANDLE handle) {
 WINAPI(FreeLibrary)
 
 __winfnc HANDLE GetModuleHandleA(const char *name) {
+    /* NULL name => handle to the "main"/currently-executing module */
+    if(!name) return cur_module ? cur_module->handle : NULL;
     struct winmodule *module = (struct winmodule*) winmodule_find(name);
     return module ? module->handle : NULL;
 }
 WINAPI(GetModuleHandleA)
 
 __winfnc HANDLE GetModuleHandleW(const char16_t *name) {
+    /* NULL name => handle to the "main"/currently-executing module */
+    if(!name) return cur_module ? cur_module->handle : NULL;
     char *cname = winstr_to_str(name);
     struct winmodule *module = (struct winmodule*) winmodule_find(cname);
     free(cname);

@@ -65,14 +65,15 @@ void wdf_cleanup_obj(struct wdf_object *obj) {
     wdf_destroy_obj_list(&obj->child_list);
 
     //Remove from parent object list
-    if(obj->parent_list && !obj->parent_list->dead) {
-        cant_fail_ret(pthread_rwlock_wrlock(&obj->parent_list->lock));
+    if(obj->parent_list) {
+        bool parent_dead = obj->parent_list->dead;
+        if(!parent_dead) cant_fail_ret(pthread_rwlock_wrlock(&obj->parent_list->lock));
 
         if(obj->prev) obj->prev->next = obj->next;
         else obj->parent_list->head = obj->next;
         if(obj->next) obj->next->prev = obj->prev;
 
-        cant_fail_ret(pthread_rwlock_unlock(&obj->parent_list->lock));
+        if(!parent_dead) cant_fail_ret(pthread_rwlock_unlock(&obj->parent_list->lock));
     }
 
     //Clear queued actions

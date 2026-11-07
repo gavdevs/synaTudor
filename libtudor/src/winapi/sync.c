@@ -1,6 +1,8 @@
 #include <assert.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <string.h>
+#include <time.h>
 #include <pthread.h>
 #include <errno.h>
 #include "internal.h"
@@ -93,7 +95,35 @@ static struct sync_event {
     pthread_mutex_t lock;
     pthread_cond_t cond;
     bool state;
+
+    //Lifetime bookkeeping. A close (or the teardown of the guest that owns the
+    //handle) can happen while another thread is still waiting on or signalling
+    //the event; Windows keeps the object alive until that operation finishes, so
+    //the destruction is deferred instead of ripping the event out from under it.
+    unsigned users;
+    bool destroyed;
 } *events_head;
+
+static unsigned live_events;
+
+static void evt_free(struct sync_event *evt) {
+    //Free memory. This only runs once the event is unlinked and nobody uses it.
+    int err = pthread_cond_destroy(&evt->cond);
+    if(err == 0) err = pthread_mutex_destroy(&evt->lock);
+    if(err != 0) {
+        //Shouldn't happen with the user count; leaking is always better than
+        //aborting the whole process (or freeing a mutex that is still locked).
+        log_warn("Leaking sync event '%s' that is still in use: %s", evt->name ? evt->name : "", strerror(err));
+        return;
+    }
+
+    free((void*) evt->name);
+    free(evt);
+
+    cant_fail_ret(pthread_rwlock_wrlock(&events_lock));
+    live_events--;
+    cant_fail_ret(pthread_rwlock_unlock(&events_lock));
+}
 
 static void evt_destr(struct sync_event *evt) {
     //Unlink the event
@@ -102,17 +132,65 @@ static void evt_destr(struct sync_event *evt) {
     if(evt->prev) evt->prev->next = evt->next;
     else events_head = evt->next;
     if(evt->next) evt->next->prev = evt->prev;
+    evt->prev = evt->next = NULL;
+
+    evt->destroyed = true;
+    bool free_now = (evt->users == 0);
 
     cant_fail_ret(pthread_rwlock_unlock(&events_lock));
 
-    //Free memory
-    cant_fail_ret(pthread_cond_destroy(&evt->cond));
-    cant_fail_ret(pthread_mutex_destroy(&evt->lock));
-    free((void*) evt->name);
-    free(evt);
+    //Free now only if no thread is still inside an operation on the event
+    if(free_now) evt_free(evt);
+}
+
+static bool evt_ref(struct sync_event *evt) {
+    //Reference the event for the duration of one operation
+    cant_fail_ret(pthread_rwlock_wrlock(&events_lock));
+    bool ok = !evt->destroyed;
+    if(ok) evt->users++;
+    cant_fail_ret(pthread_rwlock_unlock(&events_lock));
+    return ok;
+}
+
+static void evt_unref(struct sync_event *evt) {
+    //Drop a reference, freeing the event if it was closed meanwhile
+    cant_fail_ret(pthread_rwlock_wrlock(&events_lock));
+    bool free_now = (--evt->users == 0 && evt->destroyed);
+    cant_fail_ret(pthread_rwlock_unlock(&events_lock));
+
+    if(free_now) evt_free(evt);
+}
+
+unsigned win_event_live_count() {
+    //Only used by the offline tests
+    cant_fail_ret(pthread_rwlock_rdlock(&events_lock));
+    unsigned count = live_events;
+    cant_fail_ret(pthread_rwlock_unlock(&events_lock));
+    return count;
+}
+
+void win_timeout_to_timespec(struct timespec *time, DWORD timeout) {
+    //pthread_*timedwait expect an absolute deadline, not a relative timeout
+    if(clock_gettime(CLOCK_REALTIME, time) != 0) {
+        time->tv_sec = 0;
+        time->tv_nsec = 0;
+        return;
+    }
+
+    time->tv_sec += timeout / 1000L;
+    time->tv_nsec += (long) (timeout % 1000L) * 1000000L;
+    if(time->tv_nsec >= 1000000000L) {
+        time->tv_nsec -= 1000000000L;
+        time->tv_sec++;
+    }
 }
 
 static DWORD evt_wait(struct sync_event *evt, DWORD timeout) {
+    if(!evt_ref(evt)) {
+        winerr_set_code(ERROR_INVALID_HANDLE);
+        return WAIT_FAILED;
+    }
+
     DWORD res = 0;
     cant_fail_ret(pthread_mutex_lock(&evt->lock));
 
@@ -120,8 +198,7 @@ static DWORD evt_wait(struct sync_event *evt, DWORD timeout) {
     while(!evt->state) {
         if(timeout != INFINITE) {
             struct timespec time;
-            time.tv_nsec = timeout * 10000000L;
-            time.tv_sec = timeout / 1000L;
+            win_timeout_to_timespec(&time, timeout);
             int err = pthread_cond_timedwait(&evt->cond, &evt->lock, &time);
             if(err == ETIMEDOUT) {
                 res = WAIT_TIMEOUT;
@@ -135,6 +212,8 @@ static DWORD evt_wait(struct sync_event *evt, DWORD timeout) {
     if(res == 0 && !evt->manual_reset) evt->state = false;
 
     cant_fail_ret(pthread_mutex_unlock(&evt->lock));
+
+    evt_unref(evt);
     return res;
 }
 
@@ -148,6 +227,8 @@ HANDLE win_create_event(const char *name, bool initial_state, bool manual_reset)
     evt->name = name ? strdup(name) : NULL;
     evt->state = initial_state;
     evt->manual_reset = manual_reset;
+    evt->users = 0;
+    evt->destroyed = false;
     cant_fail_ret(pthread_mutex_init(&evt->lock, NULL));
     cant_fail_ret(pthread_cond_init(&evt->cond, NULL));
 
@@ -158,6 +239,7 @@ HANDLE win_create_event(const char *name, bool initial_state, bool manual_reset)
     evt->next = events_head;
     if(events_head) events_head->prev = evt;
     events_head = evt;
+    live_events++;
 
     cant_fail_ret(pthread_rwlock_unlock(&events_lock));
 
@@ -167,21 +249,25 @@ HANDLE win_create_event(const char *name, bool initial_state, bool manual_reset)
 void win_set_event(HANDLE handle) {
     struct sync_event *evt = (struct sync_event*) handle->data;
 
-    //Signal the event
+    //Signal the event; the guest may have closed the handle already
+    if(!evt_ref(evt)) return;
     cant_fail_ret(pthread_mutex_lock(&evt->lock));
     evt->state = true;
     cant_fail_ret(pthread_cond_broadcast(&evt->cond));
     cant_fail_ret(pthread_mutex_unlock(&evt->lock));
+    evt_unref(evt);
 }
 
 void win_reset_event(HANDLE handle) {
     struct sync_event *evt = (struct sync_event*) handle->data;
 
-    //Reset the event
+    //Reset the event; the guest may have closed the handle already
+    if(!evt_ref(evt)) return;
     cant_fail_ret(pthread_mutex_lock(&evt->lock));
     evt->state = false;
     cant_fail_ret(pthread_cond_broadcast(&evt->cond));
     cant_fail_ret(pthread_mutex_unlock(&evt->lock));
+    evt_unref(evt);
 }
 
 __winfnc HANDLE CreateEventA(void *attrs, BOOL manual_reset, BOOL initial_state, const char *name) {

@@ -22,9 +22,14 @@ struct crypt_key {
 
     void *plain_data;
     size_t plain_size;
+
+    /* CAPI symmetric (CryptSetKeyParam) state */
+    unsigned char iv[16];
+    DWORD mode;     /* CRYPT_MODE_* (default CBC) */
+    DWORD padding;  /* PKCS5_PADDING default */
 };
 
-extern struct crypt_provider crypt_prov_rsa_aes;
+extern struct crypt_provider crypt_prov_rsa_full, crypt_prov_rsa_aes;
 
 struct crypt_hash_algorithm;
 struct crypt_hash;
