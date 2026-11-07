@@ -28,6 +28,8 @@ typedef struct _IPCMessageBuf {
         struct ipc_msg_verify verify;
         struct ipc_msg_resp_verify resp_verify;
         struct ipc_msg_resp_identify resp_identify;
+        struct ipc_msg_resp_list_records resp_list_records;
+        struct ipc_msg_resp_error resp_error;
     };
 } IPCMessageBuf;
 
@@ -45,6 +47,28 @@ static inline bool check_ipc_msg_size(IPCMessageBuf *msg, size_t min_size, GErro
         *error = fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO, "Message 0x%x smaller than minimum size", msg->type);
         return false;
     }
+    return true;
+}
+
+//Validates an IPC_MSG_RESP_LIST_RECORDS message and stores the number of records it
+//carries in num_records. The record array has a variable length, so the message size
+//must agree with both the announced count and the record size.
+static inline bool check_ipc_record_list(IPCMessageBuf *msg, size_t *num_records, GError **error) {
+    if(!check_ipc_msg_size(msg, sizeof(msg->resp_list_records), error)) return false;
+
+    size_t recs_size = msg->size - sizeof(msg->resp_list_records);
+    if(recs_size % sizeof(struct ipc_stored_record) != 0) {
+        *error = fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO, "Record list size %lu isn't a multiple of the record size", recs_size);
+        return false;
+    }
+
+    size_t count = recs_size / sizeof(struct ipc_stored_record);
+    if(count != msg->resp_list_records.num_records || count > IPC_MAX_LISTED_RECORDS) {
+        *error = fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO, "Record list contains %lu records but %u were announced (max %d)", count, msg->resp_list_records.num_records, IPC_MAX_LISTED_RECORDS);
+        return false;
+    }
+
+    *num_records = count;
     return true;
 }
 

@@ -37,6 +37,17 @@ static void enroll_recv_cb(GObject *src_obj, GAsyncResult *res, gpointer user_da
             fpi_device_enroll_complete(FP_DEVICE(tdev), NULL, handle_cancel_ack(tdev));
             free_enroll_params(params);
         } break;
+        case IPC_MSG_RESP_ERROR: {
+            if(!check_ipc_msg_size(msg, sizeof(msg->resp_error), &error)) {
+                fpi_device_enroll_complete(FP_DEVICE(tdev), NULL, error);
+                free_enroll_params(params);
+                break;
+            }
+
+            g_warning("Tudor host reported enroll failure code %d", msg->resp_error.code);
+            fpi_device_enroll_complete(FP_DEVICE(tdev), NULL, tudor_error_from_ipc(msg->resp_error.code));
+            free_enroll_params(params);
+        } break;
         case IPC_MSG_RESP_ENROLL: {
             if(!check_ipc_msg_size(msg, sizeof(msg->resp_enroll), &error)) {
                 fpi_device_enroll_complete(FP_DEVICE(tdev), NULL, error);

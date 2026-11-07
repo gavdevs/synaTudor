@@ -192,10 +192,10 @@ int main() {
     }
     log_info("Opened tudor device");
 
-    //Check that we have determined the sensor name
+    //The sensor name is only needed to persist pairing data. Some driver paths
+    //pair without requesting it; fprintd can still use the sensor in that case.
     if(!has_sensor_name) {
-        log_error("Failed to acquire sensor name!");
-        return EXIT_FAILURE;
+        log_warn("Driver did not request a sensor pairing name; continuing without pairing persistence");
     }
 
     //Send ready message

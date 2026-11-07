@@ -30,7 +30,24 @@ enum ipc_msg_type {
     IPC_MSG_VERIFY,
     IPC_MSG_RESP_VERIFY,
     IPC_MSG_IDENTIFY,
-    IPC_MSG_RESP_IDENTIFY
+    IPC_MSG_RESP_IDENTIFY,
+
+    IPC_MSG_LIST_RECORDS,
+    IPC_MSG_RESP_LIST_RECORDS,
+
+    IPC_MSG_RESP_ERROR
+};
+
+//Error codes reported by the host when an action fails in a defined way instead of
+//killing the host process. The module maps them to FpDeviceError codes.
+enum ipc_error_code {
+    IPC_ERR_NONE = 0,
+    //CommitEnrollment/CheckForDuplicate reported WINBIO_E_DUPLICATE_ENROLLMENT
+    IPC_ERR_DUPLICATE_ENROLLMENT,
+    //CommitEnrollment failed for any other reason
+    IPC_ERR_COMMIT_FAILED,
+    //The adapter action could not be started or completed
+    IPC_ERR_ACTION_FAILED
 };
 
 #define IPC_SENSOR_NAME_SIZE 128
@@ -120,6 +137,27 @@ struct ipc_msg_resp_identify {
     bool retry, did_match;
     RECGUID guid;
     enum tudor_finger finger;
+};
+
+//Maximum number of records returned by IPC_MSG_RESP_LIST_RECORDS
+#define IPC_MAX_LISTED_RECORDS 64
+
+struct ipc_stored_record {
+    RECGUID guid;
+    enum tudor_finger finger;
+};
+
+struct ipc_msg_resp_list_records {
+    enum ipc_msg_type type;
+
+    uint32_t num_records;
+    struct ipc_stored_record records[];
+};
+
+struct ipc_msg_resp_error {
+    enum ipc_msg_type type;
+
+    enum ipc_error_code code;
 };
 
 #endif

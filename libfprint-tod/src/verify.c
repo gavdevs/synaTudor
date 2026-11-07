@@ -35,6 +35,17 @@ static void verify_recv_cb(GObject *src_obj, GAsyncResult *res, gpointer user_da
             fpi_device_verify_complete(FP_DEVICE(tdev), handle_cancel_ack(tdev));
             free_verify_params(params);
         } break;
+        case IPC_MSG_RESP_ERROR: {
+            if(!check_ipc_msg_size(msg, sizeof(msg->resp_error), &error)) {
+                fpi_device_verify_complete(FP_DEVICE(tdev), error);
+                free_verify_params(params);
+                break;
+            }
+
+            g_warning("Tudor host reported verify failure code %d", msg->resp_error.code);
+            fpi_device_verify_complete(FP_DEVICE(tdev), tudor_error_from_ipc(msg->resp_error.code));
+            free_verify_params(params);
+        } break;
         case IPC_MSG_RESP_VERIFY: {
             if(!check_ipc_msg_size(msg, sizeof(msg->resp_verify), &error)) {
                 fpi_device_verify_complete(FP_DEVICE(tdev), error);

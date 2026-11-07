@@ -39,6 +39,18 @@ static inline void send_ack(int ipc_sock) {
     ipc_send_msg(ipc_sock, &type, sizeof(type));
 }
 
+//Report a defined failure to the module instead of killing the host process. The host
+//serves a running libfprint session, so aborting on an ordinary adapter failure (a
+//duplicate finger, a failed commit, a dead capture) would tear down the whole device.
+static inline void send_error(int ipc_sock, enum ipc_error_code code) {
+    struct ipc_msg_resp_error msg = {
+        .type = IPC_MSG_RESP_ERROR,
+        .code = code
+    };
+    ipc_send_msg(ipc_sock, &msg, sizeof(msg));
+    log_warn("Reported IPC error code %d to the module", code);
+}
+
 static inline void check_in_action(struct handler_state *state, enum ipc_msg_type type) {
     if(state->async_res) {
         log_error("Invalid message 0x%x while already in an action!", type);
@@ -69,10 +81,7 @@ static void enroll_cb(tudor_async_res_t *res, bool success, struct handler_state
     cant_fail_ret(pthread_mutex_lock(&state->lock));
 
     if(!cleanup_action(state)) {
-        if(!tudor_enroll_discard(state->dev)) {
-            log_error("Couldn't discard enrollment!");
-            abort();
-        }
+        if(!tudor_enroll_discard(state->dev)) log_error("Couldn't discard enrollment!");
 
         cant_fail_ret(pthread_mutex_unlock(&state->lock));
         return;
@@ -81,20 +90,35 @@ static void enroll_cb(tudor_async_res_t *res, bool success, struct handler_state
     //Check success
     if(!success && state->action.enroll.done) {
         log_error("Enroll action failed!");
-        abort();
+        if(!tudor_enroll_discard(state->dev)) log_error("Couldn't discard enrollment!");
+        send_error(state->ipc_sock, IPC_ERR_ACTION_FAILED);
+
+        cant_fail_ret(pthread_mutex_unlock(&state->lock));
+        return;
     }
 
     //Send response
     if(state->action.enroll.done) {
         //Commit the enrollment
-        bool is_dupl;
+        bool is_dupl = false;
         if(!tudor_enroll_commit(state->dev, &is_dupl)) {
-            log_error("Couldn't commit enrollment!");
-            abort();
-        }
-        if(is_dupl) log_warn("Overwritting duplicate enrollment...");
+            //WinBioEnrollCommit reports a duplicate finger as a failure and the framework
+            //then discards the pending enrollment. Never turn that into a success.
+            if(is_dupl) {
+                log_warn("Enrollment of GUID %08x... finger %d is a duplicate - discarding", state->action.enroll.guid.PartA, state->action.enroll.finger);
+            } else {
+                log_error("Couldn't commit enrollment!");
+            }
 
-        //Find the resulting record
+            if(!tudor_enroll_discard(state->dev)) log_error("Couldn't discard enrollment!");
+            send_error(state->ipc_sock, is_dupl ? IPC_ERR_DUPLICATE_ENROLLMENT : IPC_ERR_COMMIT_FAILED);
+
+            cant_fail_ret(pthread_mutex_unlock(&state->lock));
+            return;
+        }
+
+        //Find the resulting record. With sensor storage the template stays on the sensor,
+        //so there is no record in the host mirror and the payload is legitimately empty.
         cant_fail_ret(pthread_mutex_lock(&state->dev->records_lock));
 
         struct tudor_record *enroll_rec = NULL;
@@ -104,18 +128,19 @@ static void enroll_cb(tudor_async_res_t *res, bool success, struct handler_state
                 break;
             }
         }
-        if(!enroll_rec) {
-            log_error("Couldn't find enrollment record!");
-            abort();
+
+        size_t rec_size = enroll_rec ? enroll_rec->data_size : 0;
+        if(rec_size > IPC_MAX_RECORD_SIZE) {
+            cant_fail_ret(pthread_mutex_unlock(&state->dev->records_lock));
+            log_error("Enrollment record size exceeding maximum size: %lu > %d!", rec_size, IPC_MAX_RECORD_SIZE);
+            send_error(state->ipc_sock, IPC_ERR_COMMIT_FAILED);
+
+            cant_fail_ret(pthread_mutex_unlock(&state->lock));
+            return;
         }
 
         //Allocate response message
-        size_t rec_size = enroll_rec->data_size, resp_size = sizeof(struct ipc_msg_resp_enroll) + rec_size;
-
-        if(rec_size > IPC_MAX_RECORD_SIZE) {
-            log_error("Enrollment record size exceeding maximum size: %lu > %d!", rec_size, IPC_MAX_RECORD_SIZE);
-            abort();
-        }
+        size_t resp_size = sizeof(struct ipc_msg_resp_enroll) + rec_size;
 
         struct ipc_msg_resp_enroll *resp = (struct ipc_msg_resp_enroll*) malloc(resp_size);
         if(!resp) {
@@ -127,7 +152,8 @@ static void enroll_cb(tudor_async_res_t *res, bool success, struct handler_state
             .retry = false,
             .done = true
         };
-        memcpy(resp->record_data, enroll_rec->data, enroll_rec->data_size);
+        if(enroll_rec) memcpy(resp->record_data, enroll_rec->data, enroll_rec->data_size);
+        else log_info("Enrollment committed to sensor storage - no host side record data");
 
         cant_fail_ret(pthread_mutex_unlock(&state->dev->records_lock));
 
@@ -141,7 +167,11 @@ static void enroll_cb(tudor_async_res_t *res, bool success, struct handler_state
         init_action(state);
         if(!tudor_enroll_capture(state->dev, &state->action.enroll.done, &state->async_res)) {
             log_error("Couldn't start enrollment capture!");
-            abort();
+            if(!tudor_enroll_discard(state->dev)) log_error("Couldn't discard enrollment!");
+            send_error(state->ipc_sock, IPC_ERR_ACTION_FAILED);
+
+            cant_fail_ret(pthread_mutex_unlock(&state->lock));
+            return;
         }
 
         //Send response
@@ -176,7 +206,9 @@ static void verify_cb(tudor_async_res_t *res, bool success, struct handler_state
     //Check success
     if(!success && !state->action.verify.retry) {
         log_error("Verify action failed!");
-        abort();
+        send_error(state->ipc_sock, IPC_ERR_ACTION_FAILED);
+        cant_fail_ret(pthread_mutex_unlock(&state->lock));
+        return;
     }
 
     //If we're retrying, start again
@@ -184,7 +216,9 @@ static void verify_cb(tudor_async_res_t *res, bool success, struct handler_state
         init_action(state);
         if(!tudor_verify(state->dev, state->action.verify.guid, state->action.verify.finger, &state->action.verify.retry, &state->action.verify.matches, &state->async_res)) {
             log_error("Couldn't start verify action retry!");
-            abort();
+            send_error(state->ipc_sock, IPC_ERR_ACTION_FAILED);
+            cant_fail_ret(pthread_mutex_unlock(&state->lock));
+            return;
         }
     }
 
@@ -217,17 +251,21 @@ static void identify_cb(tudor_async_res_t *res, bool success, struct handler_sta
     }
 
     //Check success
-    if(!success) {
+    if(!success && !state->action.identify.retry) {
         log_error("Identify action failed!");
-        abort();
+        send_error(state->ipc_sock, IPC_ERR_ACTION_FAILED);
+        cant_fail_ret(pthread_mutex_unlock(&state->lock));
+        return;
     }
 
     //If we're retrying, start again
-    if(!success && !state->action.verify.retry) {
+    if(!success) {
         init_action(state);
         if(!tudor_identify(state->dev, &state->action.identify.retry, &state->action.identify.has_match, &state->action.identify.guid, &state->action.identify.finger, &state->async_res)) {
             log_error("Couldn't start identify action retry!");
-            abort();
+            send_error(state->ipc_sock, IPC_ERR_ACTION_FAILED);
+            cant_fail_ret(pthread_mutex_unlock(&state->lock));
+            return;
         }
     }
 
@@ -319,9 +357,22 @@ static inline bool handle_msg(struct handler_state *state, enum ipc_msg_type typ
             struct ipc_msg_del_record msg;
             ipc_recv_msg(state->ipc_sock, &msg, type, sizeof(msg), sizeof(msg), NULL);
 
-            //Delete the record
+            //Delete from whichever backend holds the enrollment. With the vendor storage the
+            //record lives in the sensor database; the host mirror only holds records loaded
+            //through ADD_RECORD, so wiping it alone would leave the sensor record behind.
+            bool deleted = true;
+            if(state->dev->sensor_storage) {
+                deleted = tudor_storage_delete_records(state->dev, &msg.guid, msg.finger);
+            }
             int num_recs = tudor_wipe_records(state->dev, &msg.guid, msg.finger);
-            log_info("Deleted %d records with GUID %08x... finger %d", num_recs, msg.guid.PartA, msg.finger);
+
+            if(!deleted) {
+                log_error("Couldn't delete record GUID %08x... finger %d from the sensor database", msg.guid.PartA, msg.finger);
+                send_error(state->ipc_sock, IPC_ERR_ACTION_FAILED);
+                break;
+            }
+
+            log_info("Deleted record GUID %08x... finger %d (%d mirrored copies)", msg.guid.PartA, msg.finger, num_recs);
 
             //Send ACK
             send_ack(state->ipc_sock);
@@ -331,9 +382,27 @@ static inline bool handle_msg(struct handler_state *state, enum ipc_msg_type typ
             check_in_action(state, type);
             consume_simple_msg(state->ipc_sock, type);
 
-            //Wipe records
-            int num_recs = tudor_wipe_records(state->dev, NULL, TUDOR_FINGER_ANY);
-            log_info("Cleared %d records", num_recs);
+            //Clear the stored records. On the sensor backend, per-record deletion is
+            //not sufficient: the vendor adapter answers success for records its query
+            //API cannot link, so a "cleared" database can still hold a template and
+            //reject the next enrollment of that finger as a duplicate. EraseDatabase
+            //replaces the whole database, which removes those unlinked entries too;
+            //tudor_storage_erase_database then reopens the session so this device
+            //stays usable for the enrollment that clear_storage precedes.
+            bool cleared = true;
+            if(state->dev->sensor_storage) {
+                cleared = tudor_storage_erase_database(state->dev);
+            } else {
+                tudor_wipe_records(state->dev, NULL, TUDOR_FINGER_ANY);
+            }
+
+            if(!cleared) {
+                log_error("Couldn't clear the sensor record database!");
+                send_error(state->ipc_sock, IPC_ERR_ACTION_FAILED);
+                break;
+            }
+
+            log_info("Cleared the stored records");
 
             //Send ACK
             send_ack(state->ipc_sock);
@@ -354,13 +423,18 @@ static inline bool handle_msg(struct handler_state *state, enum ipc_msg_type typ
             //Start enrollment
             if(!tudor_enroll_start(state->dev, msg.guid, msg.finger)) {
                 log_error("Couldn't start enrollment!");
-                abort();
+                send_ack(state->ipc_sock);
+                send_error(state->ipc_sock, IPC_ERR_ACTION_FAILED);
+                break;
             }
 
             //Start first capture
             if(!tudor_enroll_capture(state->dev, &state->action.enroll.done, &state->async_res)) {
                 log_error("Couldn't start enrollment capture!");
-                abort();
+                if(!tudor_enroll_discard(state->dev)) log_error("Couldn't discard enrollment!");
+                send_ack(state->ipc_sock);
+                send_error(state->ipc_sock, IPC_ERR_ACTION_FAILED);
+                break;
             }
             log_debug("Started enroll action");
             tudor_set_async_callback(state->async_res, (tudor_async_cb_fnc*) enroll_cb, state);
@@ -384,7 +458,9 @@ static inline bool handle_msg(struct handler_state *state, enum ipc_msg_type typ
             //Start verify action
             if(!tudor_verify(state->dev, msg.guid, msg.finger, &state->action.verify.retry, &state->action.verify.matches, &state->async_res)) {
                 log_error("Couldn't start verify action!");
-                abort();
+                send_ack(state->ipc_sock);
+                send_error(state->ipc_sock, IPC_ERR_ACTION_FAILED);
+                break;
             }
             log_debug("Started verify action");
             tudor_set_async_callback(state->async_res, (tudor_async_cb_fnc*) verify_cb, state);
@@ -403,13 +479,54 @@ static inline bool handle_msg(struct handler_state *state, enum ipc_msg_type typ
             //Start identify action
             if(!tudor_identify(state->dev, &state->action.identify.retry, &state->action.identify.has_match, &state->action.identify.guid, &state->action.identify.finger, &state->async_res)) {
                 log_error("Couldn't start identify action!");
-                abort();
+                send_ack(state->ipc_sock);
+                send_error(state->ipc_sock, IPC_ERR_ACTION_FAILED);
+                break;
             }
             log_debug("Started identify action");
             tudor_set_async_callback(state->async_res, (tudor_async_cb_fnc*) identify_cb, state);
 
             //Send ACK
             send_ack(state->ipc_sock);
+        } break;
+
+        case IPC_MSG_LIST_RECORDS: {
+            check_in_action(state, type);
+            consume_simple_msg(state->ipc_sock, type);
+
+            //Enumerate through the configured storage adapter (sensor DB or host list)
+            struct tudor_stored_record records[IPC_MAX_LISTED_RECORDS];
+            int num_records = tudor_storage_get_records(state->dev, records, IPC_MAX_LISTED_RECORDS);
+            if(num_records < 0) {
+                log_error("Couldn't enumerate stored records!");
+                send_error(state->ipc_sock, IPC_ERR_ACTION_FAILED);
+                break;
+            }
+            if(num_records > IPC_MAX_LISTED_RECORDS) {
+                //Truncating would make the module believe records are gone (it prunes local
+                //prints against this list), so refuse instead.
+                log_error("Sensor holds %d records but only %d can be listed", num_records, IPC_MAX_LISTED_RECORDS);
+                send_error(state->ipc_sock, IPC_ERR_ACTION_FAILED);
+                break;
+            }
+
+            size_t resp_size = sizeof(struct ipc_msg_resp_list_records) + num_records * sizeof(struct ipc_stored_record);
+            struct ipc_msg_resp_list_records *resp = (struct ipc_msg_resp_list_records*) malloc(resp_size);
+            if(!resp) {
+                perror("Couldn't allocate record list response buffer");
+                abort();
+            }
+            resp->type = IPC_MSG_RESP_LIST_RECORDS;
+            resp->num_records = num_records;
+            for(int i = 0; i < num_records; i++) {
+                resp->records[i].guid = records[i].guid;
+                resp->records[i].finger = records[i].finger;
+            }
+
+            ipc_send_msg(state->ipc_sock, resp, resp_size);
+            free(resp);
+
+            log_info("Listed %d stored records", num_records);
         } break;
 
         default: {

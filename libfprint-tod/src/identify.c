@@ -46,6 +46,17 @@ static void identify_recv_cb(GObject *src_obj, GAsyncResult *res, gpointer user_
             fpi_device_identify_complete(FP_DEVICE(tdev), handle_cancel_ack(tdev));
             free_identify_params(params);
         } break;
+        case IPC_MSG_RESP_ERROR: {
+            if(!check_ipc_msg_size(msg, sizeof(msg->resp_error), &error)) {
+                fpi_device_identify_complete(FP_DEVICE(tdev), error);
+                free_identify_params(params);
+                break;
+            }
+
+            g_warning("Tudor host reported identify failure code %d", msg->resp_error.code);
+            fpi_device_identify_complete(FP_DEVICE(tdev), tudor_error_from_ipc(msg->resp_error.code));
+            free_identify_params(params);
+        } break;
         case IPC_MSG_RESP_IDENTIFY: {
             if(!check_ipc_msg_size(msg, sizeof(msg->resp_identify), &error)) {
                 fpi_device_identify_complete(FP_DEVICE(tdev), error);
@@ -70,34 +81,28 @@ static void identify_recv_cb(GObject *src_obj, GAsyncResult *res, gpointer user_
                 break;
             }
 
-            //Search database mirror for record which matched
-            TudorRecord *match_rec = NULL;
-            for(int i = 0; i < tdev->db_records->len; i++) {
-                TudorRecord *rec = (TudorRecord*) tdev->db_records->pdata[i];
-                if(memcmp(&rec->guid, &msg->resp_identify.guid, sizeof(RECGUID)) != 0 || rec->finger != msg->resp_identify.finger) continue;
-                match_rec = rec;
-                break;
-            }
-            if(!match_rec) {
-                g_warning("Tudor host reported identify match but couldn't find matching record!");
-                fpi_device_identify_report(FP_DEVICE(tdev), NULL, NULL, NULL);
-                fpi_device_identify_complete(FP_DEVICE(tdev), NULL);
-                free_identify_params(params);
-                break;
-            }
-            g_info("Tudor host reported identify match: GUID %08x... finger %d", match_rec->guid.PartA, match_rec->finger);
-
-            //Check if the print shows up in the list of prints to match against
-            FpPrint *list_print = NULL;
+            //Check if the print shows up in the list of prints to match against. The host
+            //identifies against its own storage, so the match may name a record that was
+            //never loaded from the caller's gallery.
+            struct identify_print *gallery_entry = NULL;
             for(int i = 0; i < params->prints->len; i++) {
                 struct identify_print *print = &g_array_index(params->prints, struct identify_print, i);
-                if(print->record != match_rec) continue;
-                list_print = print->print;
+                if(memcmp(&print->record->guid, &msg->resp_identify.guid, sizeof(RECGUID)) != 0 || print->record->finger != msg->resp_identify.finger) continue;
+                gallery_entry = print;
                 break;
             }
 
-            //Report the result
-            fpi_device_identify_report(FP_DEVICE(tdev), list_print, match_rec->print, NULL);
+            //Resolve the matched record, synthesizing it when the caller does not know it
+            TudorRecord *match_rec = gallery_entry ? gallery_entry->record
+                : tudor_get_db_record(tdev, msg->resp_identify.guid, msg->resp_identify.finger);
+
+            g_info("Tudor host reported identify match: GUID %08x... finger %d (%s)",
+                match_rec->guid.PartA, match_rec->finger, gallery_entry ? "in gallery" : "device only");
+
+            //Report the result. libfprint requires the recognized print even when there is
+            //no match in the gallery: fprintd uses it to delete device records it does not
+            //know about (enroll duplicate cleanup) and to spot stale local prints.
+            fpi_device_identify_report(FP_DEVICE(tdev), gallery_entry ? gallery_entry->print : NULL, match_rec->print, NULL);
             fpi_device_identify_complete(FP_DEVICE(tdev), NULL);
             free_identify_params(params);
         } break;

@@ -76,8 +76,80 @@ TudorRecord *new_record(RECGUID guid, enum tudor_finger finger, GBytes *data, Fp
     rec->guid = guid;
     rec->finger = finger;
     rec->data = data;
-    rec->print = g_object_ref(print);
+    rec->print = print ? g_object_ref(print) : NULL;
     return rec;
+}
+
+GError *tudor_error_from_ipc(enum ipc_error_code code) {
+    //Failures the host reports explicitly. A duplicate enrollment is a defined outcome
+    //(WinBioEnrollCommit returns WINBIO_E_DUPLICATE_ENROLLMENT), never a success.
+    switch(code) {
+        case IPC_ERR_DUPLICATE_ENROLLMENT:
+            return fpi_device_error_new_msg(FP_DEVICE_ERROR_DATA_DUPLICATE, "Finger is already enrolled on the sensor");
+        case IPC_ERR_COMMIT_FAILED:
+            return fpi_device_error_new_msg(FP_DEVICE_ERROR_GENERAL, "Tudor host failed to commit the enrollment");
+        case IPC_ERR_ACTION_FAILED:
+            return fpi_device_error_new_msg(FP_DEVICE_ERROR_GENERAL, "Tudor host failed to run the requested action");
+        case IPC_ERR_NONE:
+        default:
+            return fpi_device_error_new_msg(FP_DEVICE_ERROR_PROTO, "Tudor host reported an unknown error code %d", code);
+    }
+}
+
+TudorRecord *tudor_find_record(GPtrArray *records, RECGUID guid, enum tudor_finger finger) {
+    for(int i = 0; i < records->len; i++) {
+        TudorRecord *rec = (TudorRecord*) records->pdata[i];
+        if(memcmp(&rec->guid, &guid, sizeof(RECGUID)) != 0 || rec->finger != finger) continue;
+        return rec;
+    }
+
+    return NULL;
+}
+
+TudorRecord *tudor_get_db_record(FpiDeviceTudor *tdev, RECGUID guid, enum tudor_finger finger) {
+    TudorRecord *rec = tudor_find_record(tdev->db_records, guid, finger);
+    if(rec) {
+        //Records created from a host match may have no print of their own yet
+        if(!rec->print) {
+            FpPrint *print = fp_print_new(FP_DEVICE(tdev));
+            fp_print_set_finger(print, fp_finger_from_tudor(finger));
+            set_print_record(tdev, print, rec);
+            g_set_object(&rec->print, print);
+            g_object_unref(print);
+        }
+        return rec;
+    }
+
+    //The host identifies against its own storage, so a match can name a record this
+    //process never loaded. Synthesize it (identity only: the template stays on the
+    //sensor) so callers still get a print they can compare and delete.
+    FpPrint *print = fp_print_new(FP_DEVICE(tdev));
+    fp_print_set_finger(print, fp_finger_from_tudor(finger));
+
+    rec = new_record(guid, finger, g_bytes_new(NULL, 0), print);
+    set_print_record(tdev, print, rec);
+    insert_db_record(tdev, rec);
+    g_object_unref(print);
+    g_object_unref(rec);
+
+    //The record list keeps the only reference
+    return tudor_find_record(tdev->db_records, guid, finger);
+}
+
+FpFinger fp_finger_from_tudor(enum tudor_finger finger) {
+    switch(finger) {
+        case TUDOR_FINGER_LH_THUMB: return FP_FINGER_LEFT_THUMB;
+        case TUDOR_FINGER_LH_INDEX_FINGER: return FP_FINGER_LEFT_INDEX;
+        case TUDOR_FINGER_LH_MIDDLE_FINGER: return FP_FINGER_LEFT_MIDDLE;
+        case TUDOR_FINGER_LH_RING_FINGER: return FP_FINGER_LEFT_RING;
+        case TUDOR_FINGER_LH_LITTLE_FINGER: return FP_FINGER_LEFT_LITTLE;
+        case TUDOR_FINGER_RH_THUMB: return FP_FINGER_RIGHT_THUMB;
+        case TUDOR_FINGER_RH_INDEX_FINGER: return FP_FINGER_RIGHT_INDEX;
+        case TUDOR_FINGER_RH_MIDDLE_FINGER: return FP_FINGER_RIGHT_MIDDLE;
+        case TUDOR_FINGER_RH_RING_FINGER: return FP_FINGER_RIGHT_RING;
+        case TUDOR_FINGER_RH_LITTLE_FINGER: return FP_FINGER_RIGHT_LITTLE;
+        default: return FP_FINGER_UNKNOWN;
+    }
 }
 
 static void load_rec_acked_cb(GObject *src_obj, GAsyncResult *res, gpointer user_data) {
@@ -230,6 +302,14 @@ struct delete_params {
     enum tudor_finger finger;
 };
 
+//Interprets a reply that was expected to be an ACK. Returns an error when the host
+//reported a defined failure instead of acknowledging the request.
+static GError *acked_reply_error(IPCMessageBuf *msg) {
+    if(msg->type != IPC_MSG_RESP_ERROR) return NULL;
+    if(msg->size < sizeof(msg->resp_error)) return fpi_device_error_new(FP_DEVICE_ERROR_PROTO);
+    return tudor_error_from_ipc(msg->resp_error.code);
+}
+
 static void delete_acked_cb(GObject *src_obj, GAsyncResult *res, gpointer user_data) {
     GTask *task = G_TASK(res);
     FpiDeviceTudor *tdev = FPI_DEVICE_TUDOR(src_obj);
@@ -239,7 +319,16 @@ static void delete_acked_cb(GObject *src_obj, GAsyncResult *res, gpointer user_d
     GError *error = NULL;
     IPCMessageBuf *msg = g_task_propagate_pointer(task, &error);
     if(!msg) {
-        fpi_device_clear_storage_complete(FP_DEVICE(tdev), error);
+        fpi_device_delete_complete(FP_DEVICE(tdev), error);
+        g_slice_free(struct delete_params, params);
+        return;
+    }
+
+    error = acked_reply_error(msg);
+    if(error) {
+        g_warning("Tudor host refused to delete record GUID %08x... finger %d", params->guid.PartA, params->finger);
+        ipc_msg_buf_free(msg);
+        fpi_device_delete_complete(FP_DEVICE(tdev), error);
         g_slice_free(struct delete_params, params);
         return;
     }
@@ -301,6 +390,14 @@ static void clear_storage_acked_cb(GObject *src_obj, GAsyncResult *res, gpointer
     GError *error = NULL;
     IPCMessageBuf *msg = g_task_propagate_pointer(task, &error);
     if(!msg) {
+        fpi_device_clear_storage_complete(FP_DEVICE(tdev), error);
+        return;
+    }
+
+    error = acked_reply_error(msg);
+    if(error) {
+        g_warning("Tudor host refused to clear the stored records");
+        ipc_msg_buf_free(msg);
         fpi_device_clear_storage_complete(FP_DEVICE(tdev), error);
         return;
     }
