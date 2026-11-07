@@ -15,6 +15,8 @@ int tudor_wipe_records(struct tudor_device *device, RECGUID *guid, enum tudor_fi
             else device->records_head = rec->next;
             if(rec->next) rec->next->prev = rec->prev;
             free(rec->data);
+            free(rec->payload);
+            free(rec->index_vector);
             free(rec);
 
             device->result_records_head = device->result_records_cursor = NULL;
@@ -50,6 +52,10 @@ bool tudor_add_record(struct tudor_device *device, RECGUID guid, enum tudor_fing
     rec->finger = finger;
     rec->data = malloc(data_size);
     rec->data_size = data_size;
+    rec->payload = NULL;
+    rec->payload_size = 0;
+    rec->index_vector = NULL;
+    rec->index_vector_count = 0;
     if(!rec->data)  { perror("Couldn't allocate record data"); abort(); }
     memcpy(rec->data, data, data_size);
 
@@ -84,14 +90,25 @@ __winfnc static HRESULT storage_QueryExtendedInfo(WINBIO_PIPELINE *pipeline, WIN
     return ERROR_SUCCESS;
 }
 
+static void *storage_copy_blob(const void *src, size_t size) {
+    if(size == 0) return NULL;
+    void *copy = malloc(size);
+    if(copy) memcpy(copy, src, size);
+    return copy;
+}
+
 __winfnc static HRESULT storage_AddRecord(WINBIO_PIPELINE *pipeline, WINBIO_STORAGE_RECORD *srec) {
     struct tudor_device *dev = (struct tudor_device*) pipeline->StorageContext;
 
     //Validate record
     if(srec->Identity->Type != WINBIO_ID_TYPE_GUID) return E_INVALIDARG;
-    if(srec->IndexElementCount != 0 || srec->PayloadBlobSize != 0) return E_INVALIDARG;
+    if(srec->IndexElementCount != 0 && !srec->IndexVector) return E_INVALIDARG;
+    if(srec->TemplateBlobSize != 0 && !srec->TemplateBlob) return E_INVALIDARG;
+    if(srec->PayloadBlobSize != 0 && !srec->PayloadBlob) return E_INVALIDARG;
 
-    log_verbose("WINBIO storage | AddRecord(guid=%08x... subfactor=%x) called", srec->Identity->TemplateGuid.PartA, srec->SubFactor);
+    log_verbose("WINBIO storage | AddRecord(guid=%08x... subfactor=%x template=%lu payload=%lu index=%lu) called",
+        srec->Identity->TemplateGuid.PartA, srec->SubFactor,
+        (unsigned long) srec->TemplateBlobSize, (unsigned long) srec->PayloadBlobSize, (unsigned long) srec->IndexElementCount);
     cant_fail_ret(pthread_mutex_lock(&dev->records_lock));
 
     //Check for duplicate record
@@ -112,10 +129,12 @@ __winfnc static HRESULT storage_AddRecord(WINBIO_PIPELINE *pipeline, WINBIO_STOR
 
     rec->prev = NULL;
     rec->next = dev->records_head;
+    rec->res_next = NULL;
 
     rec->identity = (WINBIO_IDENTITY*) malloc(sizeof(WINBIO_IDENTITY));
     if(!rec->identity) {
         HRESULT hr = winerr_from_errno();
+        free(rec);
         cant_fail_ret(pthread_mutex_unlock(&dev->records_lock));
         return hr;
     }
@@ -123,15 +142,27 @@ __winfnc static HRESULT storage_AddRecord(WINBIO_PIPELINE *pipeline, WINBIO_STOR
 
     rec->guid = *(RECGUID*) &srec->Identity->TemplateGuid;
     rec->finger = (enum tudor_finger) srec->SubFactor;
-    rec->data = malloc(srec->TemplateBlobSize);
+
+    rec->data = storage_copy_blob(srec->TemplateBlob, srec->TemplateBlobSize);
     rec->data_size = srec->TemplateBlobSize;
-    if(!rec->data) {
+    rec->payload = storage_copy_blob(srec->PayloadBlob, srec->PayloadBlobSize);
+    rec->payload_size = srec->PayloadBlobSize;
+    rec->index_vector = (uint32_t*) storage_copy_blob(srec->IndexVector, srec->IndexElementCount * sizeof(ULONG));
+    rec->index_vector_count = srec->IndexElementCount;
+    if(
+        (rec->data_size && !rec->data) ||
+        (rec->payload_size && !rec->payload) ||
+        (rec->index_vector_count && !rec->index_vector)
+    ) {
         HRESULT hr = winerr_from_errno();
+        free(rec->data);
+        free(rec->payload);
+        free(rec->index_vector);
+        free(rec->identity);
         free(rec);
         cant_fail_ret(pthread_mutex_unlock(&dev->records_lock));
         return hr;
     }
-    memcpy(rec->data, srec->TemplateBlob, rec->data_size);
 
     if(dev->records_head) dev->records_head->prev = rec;
     dev->records_head = rec;
@@ -161,6 +192,8 @@ __winfnc static HRESULT storage_DeleteRecord(WINBIO_PIPELINE *pipeline, WINBIO_I
             else dev->records_head = rec->next;
             if(rec->next) rec->next->prev = rec->prev;
             free(rec->data);
+            free(rec->payload);
+            free(rec->index_vector);
             free(rec->identity);
             free(rec);
 
@@ -210,10 +243,8 @@ __winfnc static HRESULT storage_QueryByContent(WINBIO_PIPELINE *pipeline, UCHAR 
 
     //Forward to QueryBySubject
     log_verbose("WINBIO storage | QueryByContent(subfactor=%x) called", subfactor);
-    return storage_QueryBySubject(pipeline, &(WINBIO_IDENTITY) {
-        .Type = WINBIO_ID_TYPE_WILDCARD,
-        .Null = 0
-    }, subfactor);
+    WINBIO_IDENTITY wildcard = tudor_wildcard_identity();
+    return storage_QueryBySubject(pipeline, &wildcard, subfactor);
 }
 
 __winfnc static HRESULT storage_GetRecordCount(WINBIO_PIPELINE *pipeline, SIZE_T *num_recs) {
@@ -278,12 +309,12 @@ __winfnc static HRESULT storage_GetCurrentRecord(WINBIO_PIPELINE *pipeline, WINB
 
     srec->Identity = dev->result_records_cursor->identity;
     srec->SubFactor = (UCHAR) dev->result_records_cursor->finger;
-    srec->IndexVector = NULL;
-    srec->IndexElementCount = 0;
+    srec->IndexVector = dev->result_records_cursor->index_vector;
+    srec->IndexElementCount = dev->result_records_cursor->index_vector_count;
     srec->TemplateBlob = dev->result_records_cursor->data;
     srec->TemplateBlobSize = dev->result_records_cursor->data_size;
-    srec->PayloadBlob = NULL;
-    srec->PayloadBlobSize = 0;
+    srec->PayloadBlob = dev->result_records_cursor->payload;
+    srec->PayloadBlobSize = dev->result_records_cursor->payload_size;
 
     cant_fail_ret(pthread_mutex_unlock(&dev->records_lock));
     return ERROR_SUCCESS;

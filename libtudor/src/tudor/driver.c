@@ -42,6 +42,7 @@ typedef BOOL __winfnc (*api_DllMain)(HANDLE hinstDLL, int fdwReason, void *lpRes
 struct windrv_dll *tudor_adapter_dll, *tudor_driver_dll;
 WINBIO_SENSOR_INTERFACE *tudor_sensor_adapter;
 WINBIO_ENGINE_INTERFACE *tudor_engine_adapter;
+WINBIO_STORAGE_INTERFACE *tudor_vendor_storage_adapter;
 
 static DRIVER_OBJECT umdf_driver;
 struct winwdf_driver *tudor_wdf_driver;
@@ -133,6 +134,22 @@ bool tudor_init() {
     if((hres = ((api_WbioQueryEngineInterface) find_dll_export(&tudor_adapter_dll->image, "WbioQueryEngineInterface"))(&tudor_engine_adapter)) != 0) {
         log_error("Error querying engine interface: 0x%x!", hres);
         return false;
+    }
+
+    //Query the vendor storage adapter. Match-in-sensor devices keep the enrollment
+    //database in the sensor; that adapter is the only path that writes it.
+    api_WbioQueryStorageInterface query_storage = (api_WbioQueryStorageInterface) find_dll_export(&tudor_adapter_dll->image, "WbioQueryStorageInterface");
+    tudor_vendor_storage_adapter = NULL;
+    if(query_storage) {
+        if((hres = query_storage(&tudor_vendor_storage_adapter)) != 0) {
+            log_error("Error querying storage interface: 0x%x!", hres);
+            return false;
+        }
+        log_info("Using vendor storage interface (version %u.%u, size %lu)",
+            tudor_vendor_storage_adapter->Version.MajorVersion, tudor_vendor_storage_adapter->Version.MinorVersion,
+            (unsigned long) tudor_vendor_storage_adapter->Size);
+    } else {
+        log_info("Driver DLL doesn't provide a storage interface");
     }
 
     return true;

@@ -66,6 +66,13 @@ struct tudor_record {
     enum tudor_finger finger;
     void *data;
     size_t data_size;
+
+    //Additional WinBio storage record fields (used by match-on-sensor engines to
+    //link a host identity to an enrollment that lives in the sensor database)
+    void *payload;
+    size_t payload_size;
+    uint32_t *index_vector;
+    size_t index_vector_count;
 };
 
 struct tudor_device {
@@ -79,6 +86,8 @@ struct tudor_device {
     //WinBIO data
     WINBIO_PIPELINE *pipeline;
     HANDLE winbio_file;
+    bool sensor_storage;   //enrollments live in the vendor storage adapter (sensor DB)
+    bool storage_erased;   //the sensor database was erased; its session is gone
 
     //Enroll data
     bool enrolling;
@@ -104,5 +113,34 @@ bool tudor_enroll_discard(struct tudor_device *device);
 
 bool tudor_verify(struct tudor_device *device, RECGUID guid, enum tudor_finger finger, bool *retry, bool *matches, tudor_async_res_t *res);
 bool tudor_identify(struct tudor_device *device, bool *retry, bool *found_match, RECGUID *guid, enum tudor_finger *finger, tudor_async_res_t *res);
+
+struct tudor_stored_record {
+    RECGUID guid;
+    enum tudor_finger finger;
+    size_t template_size;
+    size_t payload_size;
+};
+
+//Enumerate/deletes through the configured storage adapter (host list or sensor DB).
+int tudor_storage_get_records(struct tudor_device *device, struct tudor_stored_record *records, int max_records);
+//Counts enrollments matching a GUID/finger filter in the active storage backend.
+//Returns -1 when enumeration fails, so callers can tell "none left" from "unknown".
+int tudor_storage_count_matching_records(struct tudor_device *device, RECGUID *guid, enum tudor_finger finger);
+bool tudor_storage_delete_records(struct tudor_device *device, RECGUID *guid, enum tudor_finger finger);
+
+//Turns TUDOR_FINGER_ANY into a concrete enrolled finger for that identity, the way
+//WinBioVerify does before it calls an engine adapter. Any other value is returned as is.
+enum tudor_finger tudor_resolve_finger(struct tudor_device *device, RECGUID guid, enum tudor_finger finger);
+
+//Fully zeroed WINBIO_IDENTITY for the given GUID (or a wildcard). The vendor adapters
+//marshal the whole identity union to the driver, so a partially initialized identity
+//would send stack bytes to the sensor.
+WINBIO_IDENTITY tudor_guid_identity(RECGUID guid);
+WINBIO_IDENTITY tudor_wildcard_identity(void);
+
+//Erases the whole storage database (sensor backend only). This removes all
+//enrollments, including any entry the record query API cannot enumerate. It is
+//irreversible and pairing-dependent data may need to be re-created afterwards.
+bool tudor_storage_erase_database(struct tudor_device *device);
 
 #endif

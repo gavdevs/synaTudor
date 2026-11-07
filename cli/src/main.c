@@ -109,6 +109,11 @@ static void *libusb_poll_thread_func(void *arg) {
 }
 
 int main(int argc, char **argv) {
+    //Our own messages go to stdout while the vendor DLL logs to stderr. Flushing
+    //every line keeps both streams in order when the output is piped to a log,
+    //which otherwise interleaves them misleadingly (and hides prompts).
+    setvbuf(stdout, NULL, _IONBF, 0);
+
     //Parse arguments
     if(argc < 2) {
         log_error("Usage: %s <data store> [flags]", argv[0]);
@@ -199,6 +204,9 @@ int main(int argc, char **argv) {
     }
 
     //Load records
+    if(device.sensor_storage) {
+        log_info("Enrollments are kept in the sensor database; the data store only holds pairing data and legacy records");
+    }
     log_info("Loading device records...");
     if(!load_datastore_records(data_store, &device)) {
         log_error("Couldn't load records from data store!");

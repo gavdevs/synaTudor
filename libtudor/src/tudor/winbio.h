@@ -286,10 +286,14 @@ typedef struct {
     WINBIO_BIR_DATA SignatureBlock;
 } WINBIO_BIR;
 
+/* Values from winbio_types.h (WINBIO_IDENTITY_TYPE). Verified against the
+ * WinBioTypes mirror of the Windows SDK header; the vendor engine accepts
+ * GUID/SID/SECURE_ID (2..4) for stored identities, which matches this numbering. */
 #define WINBIO_ID_TYPE_NULL 0
 #define WINBIO_ID_TYPE_WILDCARD 1
 #define WINBIO_ID_TYPE_GUID 2
 #define WINBIO_ID_TYPE_SID 3
+#define WINBIO_ID_TYPE_SECURE_ID 4
 
 typedef struct _WINBIO_IDENTITY {
     ULONG Type;
